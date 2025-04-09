@@ -18,8 +18,8 @@ import pandas as pd
 from google.transit import gtfs_realtime_pb2
 
 from .utils import (get_env_var, async_retry, time_it_async, parse_flexible_timestamp,
-                    get_current_utc_datetime, DEFAULT_CACHE_TTL_SECONDS, safe_float,
-                    safe_int)
+                    get_current_utc_datetime, DEFAULT_CACHE_TTL_SECONDS,
+                    DEFAULT_GTFS_RT_STALENESS_SECONDS, safe_float, safe_int)
 
 logger = logging.getLogger(__name__)
 
@@ -160,85 +160,88 @@ async def store_static_gtfs(feed:gk.Feed, schema: Optional[str] = 'gtfs'):
         logger.error(f"Unexpected error storing static GTFS feed to schema '{schema}': {e}", exc_info=True)
         return False
 
-async def _create_gtfs_indexes(schema: str):
-    """Creates recommended indexes on the GTFS tables for faster queries."""
+async def _create_gtfs_indexes(schema:str):
+    """Creates potentially useful indexes on GTFS tables after loading"""
     pool = await get_postgres_pool()
-    if not pool:
-        logger.error("Cannot create GTFS indexes: PostgreSQL pool not available.")
-        return
-
-    logger.info(f"Creating indexes for GTFS schema '{schema}'...")
-    # Define indexes: (table, column or columns tuple)
-    indexes_to_create = [
-        ("stops", "stop_id"),
-        ("routes", "route_id"),
-        ("trips", "trip_id"),
-        ("trips", "route_id"),
-        ("trips", "service_id"),
-        ("stop_times", "trip_id"),
-        ("stop_times", "stop_id"),
-        ("stop_times", ("arrival_time", "departure_time")), # Index arrival/departure
-        ("calendar", "service_id"),
-        ("calendar_dates", "service_id"),
-        ("calendar_dates", "date"),
-        # Add more indexes as needed based on query patterns
+    index_commands = [
+        f"CREATE INDEX IF NOT EXISTS idx_{schema}_stops_stop_id ON {schema}.stops(stop_id);",
+        f"CREATE INDEX IF NOT EXISTS idx_{schema}_trips_trip_id ON {schema}.trips(trip_id);",
+        f"CREATE INDEX IF NOT EXISTS idx_{schema}_trips_route_id ON {schema}.trips(route_id);",
+        f"CREATE INDEX IF NOT EXISTS idx_{schema}_stop_times_trip_id ON {schema}.stop_times(trip_id);",
+        f"CREATE INDEX IF NOT EXISTS idx_{schema}_stop_times_stop_id ON {schema}.stop_times(stop_id);",
+        f"CREATE INDEX IF NOT EXISTS idx_{schema}_stop_times_arrival_time ON {schema}.stop_times(arrival_time);",
+        f"CREATE INDEX IF NOT EXISTS idx_{schema}_stop_times_departure_time ON {schema}.stop_times(departure_time);",
+        # Add spatial index if using PostGIS and gtfs-kit didn't create one
+        f"CREATE INDEX IF NOT EXISTS idx_{schema}_stops_geom ON {schema}.stops USING GIST (geometry);"
     ]
-
     async with pool.acquire() as conn:
-        async with conn.transaction(): # Run index creation in a transaction
-            for table, columns in indexes_to_create:
-                # Ensure schema and table/column names are properly quoted
-                safe_schema = asyncpg.utils.quote_ident(schema)
-                safe_table = asyncpg.utils.quote_ident(table)
-                
-                if isinstance(columns, tuple):
-                    # Multi-column index
-                    column_names = ", ".join(asyncpg.utils.quote_ident(col) for col in columns)
-                    index_name = f"idx_{table}_{'_'.join(columns)}"
-                else:
-                    # Single-column index
-                    column_names = asyncpg.utils.quote_ident(columns)
-                    index_name = f"idx_{table}_{columns}"
-                
-                safe_index_name = asyncpg.utils.quote_ident(index_name)
-                
-                sql = f"CREATE INDEX IF NOT EXISTS {safe_index_name} ON {safe_schema}.{safe_table} ({column_names})"
+        async with conn.transaction():
+            logger.info(f"Attempting to create indexes in schema '{schema}'...")
+            for cmd in index_commands:
                 try:
-                    logger.debug(f"Executing: {sql}")
-                    await conn.execute(sql)
-                except asyncpg.PostgresError as e:
-                    logger.warning(f"Failed to create index {safe_index_name} on {safe_schema}.{safe_table}: {e}")
+                    await conn.execute(cmd)
+                except asyncpg.UndefinedTableError:
+                    logger.warning(f"Could not create index: Table for command '{cmd}' likely doesn't exist. Skipping.")
+                    # Break if tables don't exist for this schema
+                    break
+                except asyncpg.DuplicateTableError: # Thrown if index already exists sometimes
+                     logger.debug(f"Index for command '{cmd}' likely already exists. Skipping.")
                 except Exception as e:
-                    logger.error(f"Unexpected error creating index {safe_index_name}: {e}", exc_info=True)
-                    # Decide if we should raise or just log and continue
+                    # Log other errors but continue trying other indexes
+                    logger.warning(f"Failed to execute index command: {cmd}. Error: {e}")
+            logger.info(f"Index creation process completed for schema '{schema}'.")
 
-    # Optional: Add spatial index for stops.geometry if using PostGIS
+@time_it_async
+@async_retry(retries=1, delay_seconds=0.5, exceptions = (redis.RedisError,))
+async def update_vehicle_position(vehicle_update:gtfs_realtime_pb2.VehiclePosition):
+    """
+    Stores the latest vehicle position information in Redis.
+
+    Uses a Redis Hash to store all attributes of a vehicle's position.
+    Key: "vehicle:{vehicle_id}" or "vehicle:trip:{trip_id}"
+
+    Args:
+        vehicle_update: A VehiclePosition protobuf message.
+    """
+    redis_client = await get_redis_client()
+    # Determine primary key: prefer vehicle_id if available
+    vehicle_id = vehicle_update.vehicle.id if vehicle_update.vehicle.HasField("id") else None
+    trip_id = vehicle_update.trip.trip_id if vehicle_update.trip.hasField("trip_id") else None
+    route_id = vehicle_update.trip.route_id if vehicle_update.trip.hasField("route_id") else None
+
+    if not vehicle_id and not trip_id:
+        logger.warning("VehiclePostition update missing both vehicle_id and trip_id. Cannot store")
+        return
+    
+    # Use vehicle_id if present, otherwise fallback to trip_id 
+    # TODO: Find a better fallback
+    redis_key = f"vehicle:{vehicle_id}" if vehicle_id else f"vehicle:trip:{trip_id}"
+    # Use a short TTL as this data is highly volatile (e.g., 5-10 minutes)
+
+    ttl_seconds = DEFAULT_GTFS_RT_STALENESS_SECONDS * 2
+
+    position_data = {"latitude":safe_float(vehicle_update.position.latitude),
+                     "longitude":safe_float(vehicle_update.position.longitude),
+                     "bearing":safe_float(vehicle_update.position.bearing),
+                     "speed":safe_float(vehicle_update.position.speed), # m/s
+                     "timestamp":safe_int(vehicle_update.timestamp),
+                     "trip_id":trip_id,
+                     "route_id":route_id,
+                     "vehicle_id":vehicle_id, # Store even if used in key
+                     "stop_id":vehicle_update.stop_id if vehicle_update.HasField("stop_id") else None,
+                     "current_status":gtfs_realtime_pb2.VehicleStopStatus.Name(vehicle_update.current_status),
+                     "congestion_level":gtfs_realtime_pb2.CongestionLevel.Name(vehicle_update.congestion_level),
+                     "occupancy_status":gtfs_realtime_pb2.OccupancyStatus.Name(vehicle_update.occupancy_status),
+                     "last_updated":get_current_utc_datetime().isformat()}
+    # Filter out None values before storing
+    position_data_filtered = {k:v for k, v in position_data.items() if v is not None}
     try:
-        async with pool.acquire() as conn:
-            safe_schema = asyncpg.utils.quote_ident(schema)
-            # Check if the geometry column exists before trying to index it
-            geom_exists = await conn.fetchval(f"""
-                SELECT EXISTS (
-                    SELECT 1 
-                    FROM information_schema.columns 
-                    WHERE table_schema = $1 AND table_name = 'stops' AND column_name = 'geometry'
-                );
-            """, schema)
+        # Use HSET to store multiple fields at once
+        await redis_client.hset(redis_key, mapping = position_data_filtered)
+        await redis_client.expire(redis_key, ttl_seconds)
+        logger.debug(f"Stored vehicle position for key: {redis_key}")
+    except redis.RedisError as e:
+        logger.error(f"Redis error storing vehicle position for {redis_key}: {e}")
+        raise # Re-raise for retry decorator
+    
 
-            if geom_exists:
-                logger.info(f"Creating spatial index on stops.geometry in schema '{schema}'...")
-                sql_spatial = f"CREATE INDEX IF NOT EXISTS {asyncpg.utils.quote_ident(f'idx_{schema}_stops_geom')} ON {safe_schema}.stops USING GIST (geometry);"
-                await conn.execute(sql_spatial)
-                logger.info("Spatial index created (or already existed).")
-            else:
-                 logger.debug("Stops geometry column not found, skipping spatial index.")
-                 
-    except asyncpg.PostgresError as e:
-        logger.warning(f"Failed to create spatial index on {schema}.stops: {e}. Is PostGIS enabled?")
-    except Exception as e:
-        logger.error(f"Unexpected error creating spatial index: {e}", exc_info=True)
-
-    logger.info(f"Finished creating indexes for GTFS schema '{schema}'.")
-
-# --- Real-time Data Storage (Redis) ---
-# ... (Keep existing code below this line) ...
