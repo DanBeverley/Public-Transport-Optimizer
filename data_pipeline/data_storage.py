@@ -243,5 +243,189 @@ async def update_vehicle_position(vehicle_update:gtfs_realtime_pb2.VehiclePositi
     except redis.RedisError as e:
         logger.error(f"Redis error storing vehicle position for {redis_key}: {e}")
         raise # Re-raise for retry decorator
-    
 
+@time_it_async
+@async_retry(retries=1, delay_seconds = 0.5, exceptions = (redis.RedisError,))
+async def store_trip_update(trip_update: gtfs_realtime_pb2.TripUpdate):
+    """
+    Stores the latest trip update information (delays, schedule changes) in Redis.
+
+    Stores data per trip. Could store all stop time updates as JSON or break down further.
+    Key: "trip_update:{trip_id}"
+
+    Args:
+        trip_update: A TripUpdate protobuf message.
+    """
+    redis_client = await get_redis_client()
+    trip_id = trip_update.trip.trip_id
+    route_id = trip_update.trip.route_id
+
+    if not trip_id:
+        logger.warning("TripUpdate message missing trip_id. Cannot store")
+        return
+    redis_key = f"trip_update: {trip_id}"
+    ttl_seconds = 60*30
+
+    update_details = {"trip_id":trip_id,
+                      "route_id":route_id,
+                      "vehicle_id":trip_id.vehicle.id if trip_update.HasField("vehicle") else None,
+                      "start_date":trip_update.trip.start_date if trip_update.trip.HasField("start_date") else None,
+                      "schedule_relationship":gtfs_realtime_pb2.TripDescriptor.ScheduleRelationship.Name(trip_update.trip.schedule_relationship),
+                      "timestamp":safe_int(trip_update.timestamp),
+                      "delay":safe_int(trip_update.delay),
+                      "last_updated": get_current_utc_datetime().isoformat(),
+                      "stop_time_updates":[]}
+    for stu in trip_update.stop_time_update:
+        stop_update = {
+            "stop_sequence": stu.stop_sequence if stu.HasField("stop_sequence") else None,
+            "stop_id": stu.stop_id if stu.HasField("stop_id") else None,
+            "arrival_delay": stu.arrival.delay if stu.HasField("arrival") and stu.arrival.HasField("delay") else None,
+            "arrival_time": stu.arrival.time if stu.HasField("arrival") and stu.arrival.HasField("time") else None,
+            "departure_delay": stu.departure.delay if stu.HasField("departure") and stu.departure.HasField("delay") else None,
+            "departure_time": stu.departure.time if stu.HasField("departure") and stu.departure.HasField("time") else None,
+            "schedule_relationship": gtfs_realtime_pb2.TripUpdate.StopTimeUpdate.ScheduleRelationship.Name(stu.schedule_relationship),
+            #TODO: Add uncertainty if needed: stu.arrival.uncertainty / stu.departure.uncertainty
+        }
+        # Filter out None values within the stop update
+        update_details["stop_time_updates"].append({k: v for k, v in stop_update.items() if v is not None})
+
+    try:
+        # Store the entire structure as a JSON string in a single Redis key
+        await redis_client.set(redis_key, json.dumps(update_details), ex=ttl_seconds)
+        logger.debug(f"Stored trip update for trip: {trip_id}")
+    except redis.RedisError as e:
+        logger.error(f"Redis error storing trip update for {trip_id}: {e}")
+        raise # Re-raise for retry
+
+@time_it_async
+@async_retry(retries = 1, delay_seconds = 0.5, exceptions=(redis.RedisError,))
+async def store_alert(alert:gtfs_realtime_pb2.Alert):
+    """
+    Stores service alert information in Redis.
+
+    Alerts are less frequent but important. Store them indexed by alert ID
+    and potentially also by affected entity (route, stop).
+
+    Args:
+        alert: An Alert protobuf message.
+    """
+    redis_client = await get_redis_client()
+    alert_id = f"alert: {hash(alert.SerializeToString())}"
+    ttl_seconds = 60*60*24
+    
+    alert_data = {
+        "cause": gtfs_realtime_pb2.Alert.Cause.Name(alert.cause),
+        "effect": gtfs_realtime_pb2.Alert.Effect.Name(alert.effect),
+        "url": alert.url.translation[0].text if alert.HasField("url") and alert.url.translation else None,
+        "header_text": alert.header_text.translation[0].text if alert.HasField("header_text") and alert.header_text.translation else None,
+        "description_text": alert.description_text.translation[0].text if alert.HasField("description_text") and alert.description_text.translation else None,
+        "active_periods": [],
+        "last_updated": get_current_utc_datetime().isoformat(),
+    }
+
+    max_end_time = 0
+    for period in alert.active_period:
+        start = safe_int(period.start)
+        end = safe_int(period.end)
+        alert_data["active_periods"].append({"start": start, "end": end})
+        if end and end > max_end_time:
+            max_end_time = end
+
+    if max_end_time > 0:
+        now_ts = int(get_current_utc_datetime().timestamp())
+        effective_ttl = max(60, max_end_time - now_ts) # At least 1 minute
+        ttl_seconds = min(ttl_seconds, effective_ttl) # Don't exceed default if end time is very far
+
+    try:
+        pipeline = redis_client.pipeline()
+        # Store the main alert data
+        pipeline.set(alert_id, json.dumps(alert_data), ex=ttl_seconds)
+
+        # Link affected entities
+        processed_entities = set()
+        for entity_selector in alert.informed_entity:
+            entity_key: Optional[str] = None
+            if entity_selector.HasField("route_id"):
+                entity_key = f"route:{entity_selector.route_id}:alerts"
+            elif entity_selector.HasField("stop_id"):
+                 entity_key = f"stop:{entity_selector.stop_id}:alerts"
+            elif entity_selector.HasField("trip") and entity_selector.trip.HasField("trip_id"):
+                 entity_key = f"trip:{entity_selector.trip.trip_id}:alerts"
+            # Add other selectors (agency_id, route_type) if needed
+
+            if entity_key and entity_key not in processed_entities:
+                 # Use a Redis Set to store the IDs of alerts affecting this entity
+                 pipeline.sadd(entity_key, alert_id)
+                 # Set TTL on the entity link set as well, maybe slightly longer than alert
+                 pipeline.expire(entity_key, ttl_seconds + 60)
+                 processed_entities.add(entity_key)
+
+        await pipeline.execute()
+        logger.debug(f"Stored alert {alert_id} affecting {len(processed_entities)} entity types.")
+
+        # TODO: adding alerts to a persistent log in PostgreSQL as well,
+        # as Redis data is volatile.
+
+    except redis.RedisError as e:
+        logger.error(f"Redis error storing alert {alert_id}: {e}")
+        raise
+
+time_it_async
+@async_retry(retries=1, delay_seconds=0.2, exceptions=(redis.RedisError,))
+async def cache_data(key: str, value: Any, ttl_seconds: int = DEFAULT_CACHE_TTL_SECONDS):
+    """
+    Caches arbitrary data (serializable to JSON) in Redis.
+
+    Args:
+        key: The cache key.
+        value: The data to cache (must be JSON serializable).
+        ttl_seconds: Cache expiration time in seconds.
+    """
+    if value is None: # Don't cache None values explicitly unless intended
+        logger.debug(f"Attempted to cache None value for key '{key}'. Skipping.")
+        return False
+    redis_client = await get_redis_client()
+    try:
+        # Serialize complex data structures to JSON
+        serialized_value = json.dumps(value)
+        await redis_client.set(key, serialized_value, ex=ttl_seconds)
+        logger.debug(f"Cached data for key: {key} with TTL: {ttl_seconds}s")
+        return True
+    except TypeError as e:
+        logger.error(f"Failed to serialize data for caching key '{key}': {e}. Ensure value is JSON serializable.")
+        return False
+    except redis.RedisError as e:
+        logger.error(f"Redis error caching data for key '{key}': {e}")
+        raise # Re-raise for retry
+
+@time_it_async
+@async_retry(retries=1, delay_seconds=0.2, exceptions=(redis.RedisError,))
+async def get_cached_data(key: str) -> Optional[Any]:
+    """
+    Retrieves cached data from Redis.
+
+    Args:
+        key: The cache key.
+
+    Returns:
+        The deserialized data, or None if key not found, expired, or error occurred.
+    """
+    redis_client = await get_redis_client()
+    try:
+        cached_value = await redis_client.get(key)
+        if cached_value:
+            logger.debug(f"Cache HIT for key: {key}")
+            try:
+                # Deserialize from JSON
+                return json.loads(cached_value)
+            except json.JSONDecodeError as e:
+                logger.error(f"Failed to deserialize cached JSON data for key '{key}': {e}")
+                # Optionally delete the corrupted key: await redis_client.delete(key)
+                return None
+        else:
+            logger.debug(f"Cache MISS for key: {key}")
+            return None
+    except redis.RedisError as e:
+        logger.error(f"Redis error retrieving cache for key '{key}': {e}")
+        # Don't raise here, just return None on cache retrieval failure
+        return None
