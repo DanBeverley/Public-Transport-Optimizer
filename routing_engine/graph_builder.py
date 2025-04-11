@@ -11,7 +11,7 @@ from typing import Dict, List, Optional, Tuple, Set
 import gtfs_kit as gk
 import pandas as pd
 
-from .models import Route, Trip, Connection, Transfer, Location, RoutingData
+from .models import Route, Trip, Connection, Transfer, Location, RoutingData, Stop
 from data_pipeline.utils import time_it
 
 logger = logging.getLogger(__name__)
@@ -181,3 +181,119 @@ def _prepare_connections(feed:gk.Feed, query_date:date) -> List[Connection]:
     logger.info(f"Prepared {len(connections)} connections active on {query_date}")
     return connections
 
+#@time_it
+def _calculate_transfer(feed:gk.Feed, stops_by_id:Dict[str, Stop],
+                        max_distance_km:float = DEFAULT_MAX_TRANSFER_DISTANCE_KM,
+                        walking_speed_kmh:float = DEFAULT_WALKING_SPEED_KHM,
+                        max_duration_minutes:int = DEFAULT_MAX_TRANSFER_DURATION_MINUTES) -> Dict[str, List[Transfer]]:
+    """
+    Calculates potential walking transfers between nearby stops.
+
+    Args:
+        feed: The gtfs_kit Feed object (needs stops table).
+        stops_by_id: Dictionary mapping stop_id to Stop objects.
+        max_distance_km: Maximum walking distance to consider.
+        walking_speed_kmh: Assumed average walking speed.
+        max_duration_minutes: Maximum allowed walking duration for a transfer.
+
+    Returns:
+        A dictionary mapping departure stop_id to a list of possible Transfers.
+    """
+    logger.info(f"Calculating transfers (max dist: {max_distance_km} km, speed: {walking_speed_kmh} km/h)...")
+    transfers_by_dep_stop:Dict[str, List[Transfer]] = {stop_id:[] for stop_id in stops_by_id}
+    max_duration = timedelta(minutes = max_duration_minutes)
+    if feed.stops is None or feed.stops.empty or len(stops_by_id)<2:
+        logger.warning("Not enough data to calculate transfers")
+        return transfers_by_dep_stop
+    # Use gtfs-kit's helper if available and suitable, otherwise manual calculation
+    # gtfs-kit's build_transfer_graph might be more sophisticated
+    try:
+        transfer_gdf = gk.miscellany.build_transfer_graph(feed, max_dist=max_distance_km)
+        walking_speed_m_per_s = (walking_speed_kmh * 1000) / 3600
+        num_transfers = 0
+
+        for _, row in transfer_gdf.iterrows():
+            from_stop_id = row["from_stop_id"]
+            to_stop_id = row["to_stop_id"]
+            distance_m = row["distance"]
+            if from_stop_id == to_stop_id:
+                continue
+            if distance_m <= 0:
+                duration = timedelta(seconds = 0)
+            else:
+                duration = timedelta(seconds = distance_m / walking_speed_m_per_s)
+            #TODO: Add a small buffer/penalty
+            if duration > max_duration:
+                continue
+            
+            transfer = Transfer(from_stop_id = from_stop_id,
+                                to_stop_id = to_stop_id,
+                                duration = duration)
+            if from_stop_id in transfers_by_dep_stop:
+                transfers_by_dep_stop[from_stop_id].append(transfer)
+                num_transfers += 1
+            else:
+                logger.warning(f"From stop id {from_stop_id} found in transfers but not in stops_by_id dict. Skipping")
+        logger.info(f"Calculated {num_transfers} potential transfers using gtfs-kit")
+    except ImportError:
+        logger.warning("geopandas not installed. Cannot use gtfs-kit's build_transfer_graph"
+                       "Falling back to basic manual calculation iwht less accurate/efficient")
+        # TODO: Implement manual Haversine distance calculation + filtering if geopandas is not available.
+        # This involves iterating through all pairs of stops (or using spatial indexing if available).
+        # Skip for now
+        pass
+    except Exception as e:
+        logger.error(f"Error calculating transfers: {e}", exc_info = True)
+    return transfers_by_dep_stop
+
+#@time_it
+def build_routing_data(feed:gk.Feed, query_date:date) -> Optional[RoutingData]:
+    """
+    Main function to build all necessary data structures for routing.
+
+    Args:
+        feed: The gtfs-kit Feed object, assumed to be loaded and valid.
+        query_date: The date for which the routing data should be generated
+                    (determines which services/trips are active).
+
+    Returns:
+        A RoutingData object containing connections, transfers, stops, etc.,
+        or None if essential data (like stop_times or active trips) is missing.
+    """
+    logger.info(f"Building routing data for date: {query_date}")
+    # Perform validation on the feed object
+    if feed is None and not isinstance(feed, gk.Feed):
+        logger.error("Invalid GTFS feed object provided")
+        return None
+    required_files = ["stop", "routes", "trips", "stop_times"] 
+    if not all(hasattr(feed, f) and getattr(feed, f) is not None and not getattr(feed, f).empty
+               for f in required_files):
+        missing = [f for f in required_files if not hasattr(feed, f) or getattr(feed, f) is None or getattr(feed, f).empty]
+        logger.error(f"GTFS feed is missing essential tables: {missing}. Cannot build routing data")
+        return None
+    stops_by_id = _prepare_stops(feed)
+    if not stops_by_id:
+        logger.error("Failed to prepare stops data. Aborting")
+        return None
+    
+    routes_by_id, trips_by_id = _prepare_routes_and_trips(feed)
+    connections = _prepare_connections(feed, query_date)
+    if not connections:
+        logger.error(f"No connections could be prepared for {query_date}. Cannot perform routing")
+        return None
+    transfers_by_departure_stop = _calculate_transfer(feed, stops_by_id)
+    # Routing can potentially proceed without transfers, but log a warning.
+    if not any(transfers_by_departure_stop.values()):
+         logger.warning("No walking transfers were calculated. Routing will only consider direct trips.")
+
+
+    routing_data = RoutingData(
+        connections=connections,
+        transfers_by_departure_stop=transfers_by_departure_stop,
+        stops_by_id=stops_by_id,
+        trips_by_id=trips_by_id,
+        routes_by_id=routes_by_id
+    )
+
+    logger.info("Successfully built routing data.")
+    return routing_data
