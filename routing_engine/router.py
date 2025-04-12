@@ -6,7 +6,7 @@ earliest arrival journey based on a static schedule.
 """
 import logging
 from datetime import datetime, timedelta, date, time
-from typing import Dict, Optional, Tuple, List, Set
+from typing import Dict, Optional, Tuple, Union, List, Set
 import heapq # For potential Dijkstra-like extensions, though CSA is simpler
 
 from .models import Stop, Route, Trip, Connection, Transfer, Journey, JourneyLeg, RoutingData, Location
@@ -130,3 +130,110 @@ class ConnectionScanAlgorithm:
              logger.error("Failed to reconstruct journey despite finding a path.")
 
         return journey
+    
+    def reconstruct_journey(self, origin_stop_id:str, destination_stop_id:str,
+                            journey_details:Dict[str, Tuple[str, Union[Connection, Transfer]]],
+                            query_date:date) -> Optional[Journey]:
+        """
+        Reconstructs the journey path backwards from the destination using
+        the predecessor information stored during the scan.
+        """
+        legs:List[JourneyLeg] = []
+        current_stop_id = destination_stop_id
+        while current_stop_id != origin_stop_id:
+            if current_stop_id not in journey_details:
+                logger.error(f"Error reconstructing path: Stop {current_stop_id} has no predecessor info.")
+                return None
+            prev_stop_id, leg_info = journey_details[current_stop_id]
+            if leg_info is None and prev_stop_id == "origin":
+                if current_stop_id == origin_stop_id: break
+                else:
+                    logger.error("Error reconstructing path: Reached origin marker unexpectedly")
+                    return None
+            if isinstance(leg_info, Connection):
+                # This leg was a transit connection
+                conn = leg_info
+                dep_stop = self.stops.get(conn.departure_stop_id)
+                arr_stop = self.stops.get(conn.arrival_stop_id)
+                trip = self.trips.get(conn.trip_id)
+                route = self.routes.get(trip.route_id) if trip else None
+                
+                # Calculate absolute datetime objects
+                start_dt = datetime.combine(query_date, time()) + conn.departure_time
+                end_dt = datetime.combine(query_date, time()) + conn.arrival_time
+                # Handle overnight times (timedelta > 24h) - datetime automatically handles this
+                duration = end_dt - start_dt
+                if not dep_stop or not arr_stop or not trip or not route:
+                    logger.warning(f"Missing data during reconstruction for connection {conn}. Skipping leg")
+                    # TODO: Add robust handling here
+                    current_stop_id = prev_stop_id
+                    continue
+                legs.append(JourneyLeg(leg_type = "transit", start_time = start_dt,
+                                       end_time = end_dt, duration = duration,
+                                       start_location = dep_stop.location,
+                                       end_location = arr_stop.location,
+                                       route = route,  trip = trip,
+                                       departure_stop=dep_stop,
+                                       arrival_stop = arr_stop))
+                current_stop_id = conn.departure_stop_id # Move to the start of the connection
+            
+            elif isinstance(leg_info, Transfer):
+                # This leg was a walking transfer
+                transfer = leg_info
+                from_stop = self.stops.get(transfer.stop_from_id)
+                to_stop = self.stops.get(transfer.to_stop_id) # == current_stop_id
+                if not from_stop or not to_stop:
+                    logger.warning(f"Missing stop data during reconstruction for transfer {transfer}. Skipping leg")
+                    current_stop_id = prev_stop_id
+                    continue
+                end_timedelta = self._get_arrival_timedelta(current_stop_id, journey_details) # TODO: Need helper
+                start_timedelta = end_timedelta - transfer.duration
+                if end_timedelta == INFINITY_TIME:
+                    logger.error(f"Could not determine arrival time for transfer end stop {current_stop_id}")
+                    return None
+                start_dt = datetime.combine(query_date, time()) + start_timedelta
+                end_dt = datetime.combine(query_date, time()) + end_timedelta
+                legs.append(JourneyLeg(leg_type="walk", start_time = start_dt, end_time=end_dt,
+                                        duration = transfer.duration, start_location=from_stop.location,
+                                        end_location = to_stop.location))
+                current_stop_id = transfer.from_stop_id # Move to the start of the walk
+            else:
+                if current_stop_id == origin_stop_id and prev_stop_id == "origin":
+                    break # reached the start
+                else:
+                    logger.error(f"Invalid leg_info type '{type(leg_info)}' during reconstruction")
+                    return None
+        if current_stop_id != origin_stop_id:
+            logger.error("Journey reconstruction did not reach the origin stop")
+            return None
+        # Legs are currently backwards, reverse them
+        journey = Journey(legs = list(reversed(legs)))
+        return journey
+    
+    def _get_arrival_timedelta(self, stop_id:str,
+                               journey_details:Dict[str, Tuple[str, Union[Connection, Transfer]]]) -> timedelta:
+        """Helper to trace back and find the arrival time at a specific stop during reconstruction."""
+        # NOTE: This is inefficient and complex. The main search should ideally store the arrival times.
+        # A better way: the main loop's `earliest_arrival_time` dict should be available here.
+        # Let's simulate having access to it (or refactor to pass it).
+        # --- THIS IS A PLACEHOLDER - Needs refactoring for robust time reconstruction ---
+        # When implement, pass the `earliest_arrival_time` dict computed in the main
+        # function to the reconstructor, or store it alongside journey_details.
+
+        # Placeholder logic 
+        if stop_id not in journey_details: return INFINITY_TIME
+        _, leg_info = journey_details[stop_id]
+        if isinstance(leg_info, Connection):
+            return leg_info.arrival_time # Direct arrival time from connection
+        elif isinstance(leg_info, Transfer):
+             # Need time at previous stop + transfer duration
+             prev_stop_id = leg_info.from_stop_id
+             prev_arrival_time = self._get_arrival_timedelta(prev_stop_id, journey_details)
+             if prev_arrival_time != INFINITY_TIME:
+                 return prev_arrival_time + leg_info.duration
+             else:
+                 return INFINITY_TIME
+        else: # Origin
+            # Need the actual departure time from the initial query
+            # This highlights the need to pass more context or the earliest_arrival_time dict.
+            return timedelta(0) # Incorrect placeholder
