@@ -235,5 +235,92 @@ def add_static_node_features(graph_data: Data, gtfs_feed: gk.Feed) -> Data:
 
     return graph_data
 
+def add_static_edge_features(graph_data:Data, gtfs_feed:gk.Feed) -> Data:
+    """Adds static edge features (scheduled time, route type) to the PyG Data object"""
+    logger.info("Adding static edge features...")
+    if not _PYG_AVAILABLE or not isinstance(graph_data, Data): return graph_data
+    if not hasattr(graph_data, 'edge_data_list'):
+        logger.warning("Graph data missing 'edge_data_list'. Cannot add edge features.")
+        return graph_data
+
+    edge_feature_list = []
+    feature_names = [] # Track feature names
+
+    # Get route type mapping if routes table exists
+    route_type_map = {}
+    num_route_types = 0
+    if gtfs_feed.routes is not None and 'route_type' in gtfs_feed.routes.columns:
+        routes_df = gtfs_feed.routes.dropna(subset=['route_id', 'route_type'])
+        unique_route_types = routes_df['route_type'].unique()
+        route_type_map = {int(rtype): i for i, rtype in enumerate(unique_route_types)}
+        num_route_types = len(route_type_map)
+        logger.info(f"Found route types: {list(route_type_map.keys())}")
+        feature_names.extend([f"route_type_{i}" for i in range(num_route_types)])
+        # Map route_id to encoded route_type for faster lookup
+        route_id_to_type_idx = routes_df.set_index('route_id')['route_type'].map(route_type_map).to_dict()
+    else: route_id_to_type_idx = {}
+
+    feature_names.append('scheduled_time_seconds') # Add scheduled time
+
+    for edge_data in graph_data.edge_data_list:
+        edge_features = []
+
+        # Route Type (One-Hot)
+        if num_route_types > 0:
+            route_type_one_hot = [0.0] * num_route_types
+            route_id = edge_data.get('route_id')
+            if route_id and route_id in route_id_to_type_idx:
+                type_idx = route_id_to_type_idx[route_id]
+                if type_idx is not None: route_type_one_hot[type_idx] = 1.0
+            edge_features.extend(route_type_one_hot)
+
+        # Scheduled Time
+        sched_time = edge_data.get('scheduled_time_seconds', 0.0) # Default 0 if missing?
+        edge_features.append(sched_time if pd.notna(sched_time) else 0.0)
+
+        # TODO: Add distance (requires shapes.txt or stop-stop distance calc)
+
+        edge_feature_list.append(edge_features)
+
+    if edge_feature_list:
+        graph_data.edge_attr = torch.tensor(edge_feature_list, dtype=torch.float32)
+        graph_data.edge_feature_names = feature_names # Store feature names
+        logger.info(f"Added static edge features. Shape: {graph_data.edge_attr.shape}")
+        # Clean up temporary data stored on graph_data
+        del graph_data.edge_data_list
+    else:
+        logger.warning("No edge features could be generated.")
 
 
+    return graph_data
+
+
+def get_transit_graph(dataset_name: str = config.ACTIVE_DATASET_NAME) -> Optional[Data]:
+    """
+    High-level function to load GTFS, build the static graph, and add features.
+
+    Args:
+        dataset_name: Name of the dataset to build the graph for.
+
+    Returns:
+        A PyG Data object representing the static graph with features, or None.
+    """
+    logger.info(f"--- Generating Static Transit Graph for {dataset_name} ---")
+    static_feed = load_static_gtfs_data(dataset_name)
+    if not static_feed:
+        return None
+
+    graph = build_static_graph(static_feed, dataset_name)
+    if not graph:
+        return None
+
+    graph = add_static_node_features(graph, static_feed)
+    graph = add_static_edge_features(graph, static_feed)
+
+    # Optional: Add self loops or make undirected if model requires
+    # if graph.edge_index is not None:
+    #     graph.edge_index, graph.edge_attr = add_self_loops(graph.edge_index, graph.edge_attr, ...)
+    #     graph = pyg.transforms.ToUndirected()(graph) # Careful with edge_attr handling
+
+    logger.info(f"--- Static Graph Generation Complete for {dataset_name} ---")
+    return graph
