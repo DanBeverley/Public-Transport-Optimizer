@@ -5,7 +5,7 @@ Builds a static graph where nodes are stops and edges represent connections
 between consecutive stops on transit routes. Adds basic static node/edge features.
 """
 import logging
-from typing import Optional, Any, Dict, List, Tuple
+from typing import Optional, Any, Dict, List, Tuple, Path
 
 import pandas as pd
 import numpy as np
@@ -33,6 +33,50 @@ logger = logging.getLogger(__name__)
 # Static GTFS Loading
 _static_gtfs_feed_cache:Dict[str, Optional[gk.Feed]] = {}
 
+def _find_gtfs_source(dataset_name:str) -> Optional[Path]:
+    ds_config = config.DATASET_CONFIGS.get(dataset_name, {})
+    raw_dir = config.DATA_PIPELINE_RAW_OUTPUT_DIR / dataset_name.lower()
+    # Method 1: Explicit path in config
+    explicit_path_str = ds_config.get("static_gtfs_path")
+    if explicit_path_str:
+        explicit_path = Path(explicit_path_str)
+        if explicit_path.exists():
+            logger.info(f"Found GTFS source via explicit config path: {explicit_path}")
+            return explicit_path
+        else:
+            logger.warning(f"Explicit GTFS path in config not found: {explicit_path}")
+    # Method 2: Standard ZIP name in Raw Dir
+    for zip_name in [f"{dataset_name.lower()}_gtfs.zip", "gtfs.zip"]:
+        path = raw_dir/zip_name
+        if path.exists():
+            logger.info(f"Found GTFS source via standard zip name: {path}")
+            return path
+    # Method 3: Extracted Directory in Raw Dir
+    for dir_name in [f"{dataset_name.lower()}_gtfs", "gtfs"]:
+        path = raw_dir / dir_name
+        if path.is_dir() and (path/"stops.txt").exists():
+            logger.info("Found GTFS source via extracted directory: {path}")
+            return path
+    # Method 4:Zip/Directory in Immediate SubFolders
+    if raw_dir.exists() and raw_dir.is_dir():
+        for sub_dir in raw_dir.iterdir():
+            if not sub_dir.is_dir():
+                continue
+            # Check for zip in subfolder
+            for zip_name in [f"{dataset_name.lower()}_gtfs.zip", "gtfs.zip"]:
+                path = sub_dir / zip_name
+                if path.exists():
+                    logger.info(f"Found GTFS source via zip in subfolder")
+                    return path
+            # Check for extracted dir in subfolder
+            for dir_name in [f"{dataset_name.lower()}_gtfs", "gtfs"]:
+                path = sub_dir/dir_name
+                if path.is_dir() and (path/"stops.txt").exists():
+                    logger.info(f"Found GTFS source via extracted directory in subfolder:{path}")
+                    return path
+    logger.error(f"Could not find GTFS source for dataset '{dataset_name}' using any strategy in/around {raw_dir}")
+    return None
+
 def load_static_gtfs_data(dataset_name:str = config.ACTIVE_DATASET_NAME) -> Optional[gk.Feed]:
     """
     Loads the static GTFS feed needed for graph construction for a specific dataset.
@@ -45,39 +89,32 @@ def load_static_gtfs_data(dataset_name:str = config.ACTIVE_DATASET_NAME) -> Opti
         A gtfs_kit Feed object or None.
     """
     if dataset_name in _static_gtfs_feed_cache:
-        return _static_gtfs_feed_cache[dataset_name]
-    logger.info(f"Attempting to load static GTFS data for graph construction (Dataset: {dataset_name})")
+        feed = _static_gtfs_feed_cache[dataset_name]
+        if feed: logger.debug(f"Using cached static GTFS feed for {dataset_name}")
+        return feed
+    logger.info(f"Attempting to load static GTFS data for graph construction (Dataset:{dataset_name})")
+    gtfs_source_path = _find_gtfs_source(dataset_name)
+    if not gtfs_source_path:
+        _static_gtfs_feed_cache[dataset_name] = None
+        return None
     try:
-        ds_raw_dir = config.DATA_PIPELINE_RAW_OUTPUT_DIR / dataset_name.lower()
-        # Look for common GTFS zip file names
-        possible_paths = list(ds_raw_dir.glob("gtfs.zip")) + list(ds_raw_dir.glob(f"{dataset_name.lower()}_gtfs.zip"))
-        if not possible_paths:
-             # Look inside subdirectories common in GTFS archives (e.g., extracted folder)
-             possible_paths = list(ds_raw_dir.glob("*/gtfs.zip")) + list(ds_raw_dir.glob(f"*/{dataset_name.lower()}_gtfs.zip"))
-
-        if not possible_paths:
-            logger.error(f"Could not find GTFS zip file in expected location: {ds_raw_dir}")
-            _static_gtfs_feed_cache[dataset_name] = None
-            return None
-
-        gtfs_path = possible_paths[0] # Use the first one found
-        logger.info(f"Found GTFS path: {gtfs_path}")
-
-        feed = gtfs_parser.load_static_gtfs(gtfs_path) # Use function from data_pipeline
+        feed = gtfs_parser.load_static_gtfs(gtfs_source_path)
         if feed:
-            logger.info(f"Loaded static GTFS for {dataset_name} successfully.")
-            # Basic validation
+            logger.info(f"Load static GTFS for {dataset_name} successfully from {gtfs_source_path}")
             if feed.stops is None or feed.stop_times is None or feed.trips is None:
-                 logger.error("Loaded GTFS feed is missing essential tables (stops, stop_times, trips).")
-                 feed = None
+                logger.error("Loaded GTFS feed is missing essential tables (stops, stop_times, trips).")
+                feed = None
+        else:
+            logger.error(f"gtfs_parser failed to load feed from {gtfs_source_path}")
+
         _static_gtfs_feed_cache[dataset_name] = feed
         return feed
 
     except Exception as e:
-        logger.error(f"Failed to load static GTFS data for {dataset_name}: {e}", exc_info=True)
+        logger.error(f"Failed to load static GTFS data for {dataset_name} from {gtfs_source_path}: {e}", exc_info=True)
         _static_gtfs_feed_cache[dataset_name] = None
         return None
-    
+
 # Graph Construction Functions (PyG)
 def build_static_graph(gtfs_feed:gk.Feed,
                     dataset_name:str = config.ACTIVE_DATASET_NAME) -> Optional[Data]:
@@ -99,17 +136,13 @@ def build_static_graph(gtfs_feed:gk.Feed,
         logger.error("Cannot build graph: GTFS feed or essential tables are missing")
         return None
     #1. Nodes: Stops
-    stops_df = gtfs_feed.stops.copy().dropna(subset = ["stop_id"]) # Ensure no NaNs stop_ids
-    stops_df["stop_id"] = stops_df["stop_id"].astype(str)
+    stops_df = gtfs_feed.stops.copy().dropna(subset=['stop_id'])
+    stops_df['stop_id'] = stops_df['stop_id'].astype(str)
     num_nodes = len(stops_df)
-    if num_nodes == 0:
-        logger.error("No stops found in GTFS data")
-        return None
-    # Create mapping from stop_id to node index (0 to num_nodes-1)
-    stop_id_to_idx = {stop_id:i for i, stop_id in enumerate(stops_df["stop_id"])}
-    # Store mapping for later use (e.g., feature alignment)
-    node_idx_to_stop_id = {i:stop_id for stop_id, i in stop_id_to_idx.items()}
-    logger.info(f"Defined {num_nodes} nodes based on stops")
+    if num_nodes == 0: logger.error("No stops found."); return None
+    stop_id_to_idx = {stop_id: i for i, stop_id in enumerate(stops_df['stop_id'])}
+    node_idx_to_stop_id = {i: stop_id for stop_id, i in stop_id_to_idx.items()}
+    logger.info(f"Defined {num_nodes} nodes based on stops.")
 
     #2. Edges: Connections between consecutive stops on trips
     edge_list_src = []
