@@ -202,5 +202,68 @@ class GNNLSTMModel(nn.Module):
         out = self.fc(last_hidden_state) # Shape: (batch_size, output_dim)
 
         return out
+    
+def build_model(input_dim: int, graph_data: Optional[Data] = None) -> nn.Module:
+    """
+    Builds and returns the appropriate model based on config settings.
+
+    Args:
+        input_dim: The dimension of the input *dynamic* features for the sequence model.
+        graph_data: The static graph Data object (required if using GNN models).
+
+    Returns:
+        An instantiated PyTorch model (nn.Module).
+    """
+    model_type = config.MODEL_TYPE
+    logger.info(f"Building model of type {model_type}")
+    # Use specific hyperparams from config if available, fallback to general ones
+    hidden_dim = config.HIDDEN_DIM
+    num_layers = config.NUM_LAYERS
+    dropout_rate = config.DROPOUT_RATE
+    output_dim = config.OUTPUT_DIM
+    # Define flags for layer norm based on config or defaults
+    use_gnn_layer_norm = getattr(config, 'GNN_USE_LAYER_NORM', True) # Example default True
+    use_lstm_layer_norm = getattr(config, 'LSTM_USE_LAYER_NORM', True) # Example default True
+    if model_type == "LSTM":
+        model = LSTMModel(input_dim = input_dim,
+                          hidden_dim = hidden_dim,
+                          num_layers = num_layers,
+                          output_dim = output_dim,
+                          dropout_rate = dropout_rate,
+                          use_layer_norm = use_lstm_layer_norm)
+    elif model_type == "GNN_LSTM":
+        if not _PYG_AVAILABLE: raise ImportError("PyG required for GNN_LSTM")
+        if graph_data is None or graph_data.x is None or graph_data.edge_attr is None:
+            raise ValueError("GNN_LSTM requires graph_data with note(x) and edge(edge_attr) features")
+        # Get dims from graph
+        node_feature_dim = graph_data.x.shape[1]
+        edge_feature_dim = graph_data.edge_attr.shape[1]
+
+        # Use specific config values if defined, else fallback
+        gnn_hidden_dim = getattr(config, 'GNN_HIDDEN_DIM', hidden_dim) # Fallback to HIDDEN_DIM
+        gnn_layers = getattr(config, 'GNN_LAYERS', num_layers)       # Fallback to NUM_LAYERS
+        # Allow separate LSTM config within GNNLSTM if needed
+        lstm_hidden_dim_combined = getattr(config, 'LSTM_HIDDEN_DIM_COMBINED', hidden_dim)
+        lstm_layers_combined = getattr(config, 'LSTM_LAYERS_COMBINED', num_layers)
+
+        model = GNNLSTMModel(
+            node_feature_dim=node_feature_dim,
+            edge_feature_dim=edge_feature_dim,
+            gnn_hidden_dim=gnn_hidden_dim,
+            gnn_layers=gnn_layers,
+            lstm_input_feature_dim=input_dim, # This is the dimension of x_seq features
+            lstm_hidden_dim=lstm_hidden_dim_combined,
+            lstm_layers=lstm_layers_combined,
+            output_dim=output_dim,
+            dropout_rate=dropout_rate,
+            gnn_use_layer_norm=use_gnn_layer_norm,
+            lstm_use_layer_norm=use_lstm_layer_norm
+        )
+    # TODO: Add other model types
+    else:
+        raise ValueError(f"Unsupported MODEL_TYPE specified in config: {model_type}")
+
+    logger.info(f"Model '{model_type}' built successfully.")
+    return model
         
         
