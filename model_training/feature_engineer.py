@@ -135,47 +135,80 @@ def generate_rolling_features(df:pd.DataFrame, features_config:Dict[str, Dict],
                     logger.error(f"Failed to calculate rolling aggregate '{agg_func}' for window {window} on column '{col}': {e}", exc_info = True)
     return df_out
 
-def select_final_features(df:pd.DataFrame, target_col:str = config.STANDARDIZED_TARGET_VARIABLE) -> Tuple[pd.DataFrame, pd.Series]:
+def select_final_features_and_target(
+    df: pd.DataFrame,
+    target_col: str = config.STANDARDIZED_TARGET_VARIABLE,
+    identifier_cols: List[str] = ['timestamp', 'trip_id', 'route_id', 'vehicle_id', 'stop_id', 'stop_sequence'] # Standardized identifiers
+    ) -> Tuple[pd.DataFrame, pd.Series, pd.DataFrame, List[str]]:
     """
-    Selects the final feature columns for the model and separates the target variable.
-    Drops rows with NaNs introduced by feature engineering (lags/rolling).
+    Selects final numeric feature columns, separates target and identifiers,
+    and drops rows with NaNs introduced by feature engineering.
 
     Args:
         df: DataFrame after all feature engineering steps.
         target_col: Name of the standardized target variable.
+        identifier_cols: List of standardized identifier columns to keep separately.
 
     Returns:
-        Tuple[pd.DataFrame, pd.Series]: (features_df, target_series)
+        Tuple: (
+            features_df: DataFrame containing only the final numeric features.
+            target_series: Series containing the target variable.
+            identifiers_df: DataFrame containing the specified identifier columns.
+            final_feature_names: List of column names in features_df.
+        )
+        Returns empty structures if processing fails or results in no data.
     """
-    logger.info("Selecting final features and handling NaNs from feature engineering.")
+    logger.info("Selecting final features, target, identifiers and handling NaNs from feature engineering.")
     if target_col not in df.columns:
-        raise ValueError(f"Target column '{target_col}' not found in final DataFrame.")
+        logger.error(f"Target column '{target_col}' not found in final DataFrame.")
+        return pd.DataFrame(), pd.Series(dtype=float), pd.DataFrame(), []
 
-    # Define final feature columns (excluding target and identifiers like timestamp, trip_id etc.)
-    exclude_cols = [target_col, 'timestamp', 'trip_id', 'route_id', 'vehicle_id', 'stop_sequence'] # Add others?
-    feature_cols = [col for col in df.columns if col not in exclude_cols and pd.api.types.is_numeric_dtype(df[col])]
+    # Identify numeric feature columns (excluding target and specified identifiers)
+    exclude_cols = set([target_col] + identifier_cols)
+    potential_feature_cols = [col for col in df.columns if col not in exclude_cols]
+    # Select only numeric types from potential features
+    numeric_feature_cols = df[potential_feature_cols].select_dtypes(include=np.number).columns.tolist()
 
-    logger.info(f"Final selected features ({len(feature_cols)}): {feature_cols}")
+    if not numeric_feature_cols:
+         logger.error("No numeric feature columns found after exclusions.")
+         return pd.DataFrame(), pd.Series(dtype=float), pd.DataFrame(), []
 
-    # Handle NaNs introduced by lag/rolling features
+    logger.info(f"Identified {len(numeric_feature_cols)} numeric features: {numeric_feature_cols[:5]}...")
+
+    # Columns to keep temporarily for NaN dropping and final selection
+    cols_to_keep = numeric_feature_cols + [target_col] + [id_col for id_col in identifier_cols if id_col in df.columns]
+
+    # Drop rows with NaNs ONLY in feature columns or target column
     initial_rows = len(df)
-    df_final = df.dropna(subset=feature_cols + [target_col])
+    # Use subset based on numeric features + target to decide which rows to drop
+    dropna_subset = numeric_feature_cols + [target_col]
+    df_final = df[cols_to_keep].dropna(subset=dropna_subset)
     rows_dropped = initial_rows - len(df_final)
-    logger.info(f"Dropped {rows_dropped} rows due to NaNs after feature engineering (expected from lags/rolling).")
+    logger.info(f"Dropped {rows_dropped} rows due to NaNs in features/target (expected from lags/rolling).")
 
     if df_final.empty:
-         raise ValueError("DataFrame is empty after dropping NaNs from feature engineering. Check lag/rolling parameters or data size.")
+         logger.error("DataFrame is empty after dropping NaNs from feature engineering.")
+         return pd.DataFrame(), pd.Series(dtype=float), pd.DataFrame(), []
 
-    X = df_final[feature_cols]
+    # Separate features, target, and identifiers
+    X = df_final[numeric_feature_cols]
     y = df_final[target_col]
+    identifiers = df_final[[id_col for id_col in identifier_cols if id_col in df_final.columns]]
+    final_feature_names = numeric_feature_cols # Store the final list of names
 
-    return X, y
+    return X, y, identifiers, final_feature_names
 
-def engineer_features_for_training(train_df:pd.DataFrame,
-                                    val_df:pd.DataFrame,
-                                    test_df:pd.DataFrame) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+def engineer_features_for_training(
+    train_df: pd.DataFrame,
+    val_df: pd.DataFrame,
+    test_df: pd.DataFrame
+    ) -> Tuple[pd.DataFrame, pd.Series, pd.DataFrame, # Train X, y, ids
+               pd.DataFrame, pd.Series, pd.DataFrame, # Val X, y, ids
+               pd.DataFrame, pd.Series, pd.DataFrame, # Test X, y, ids
+               List[str]]:                           # Final feature names
     """
     Applies the full feature engineering pipeline to preprocessed train, val, test sets.
+    Returns DataFrames for features, targets, and identifiers, plus the final feature names list.
 
     Args:
         train_df: Preprocessed training DataFrame (standardized columns, scaled).
@@ -183,71 +216,61 @@ def engineer_features_for_training(train_df:pd.DataFrame,
         test_df: Preprocessed test DataFrame.
 
     Returns:
-        Tuple: (train_X, train_y, val_X, val_y, test_X, test_y) as NumPy arrays.
+        Tuple containing features, target, identifiers for train, val, test,
+        and the list of final feature names.
     """
-    logger.info("Starting Feature Engineering Pipeline")
-    # Apply feature generation steps consistently to all sets
-    datasets = {"train":train_df, "val":val_df, "test":test_df}
-    processed_datasets = {}
-    for name, df in datasets.items():
-        logger.info(f"Processing dataset split: {name} (shape:{df.shape})")
-        if df.empty:
-            logger.warning(f"Dataset split '{name}' is emptyu. Skipping feature engineering")
-            processed_datasets[name] = pd.DataFrame()
+    logger.info("--- Starting Feature Engineering Pipeline ---")
+    final_data = {}
+    final_feature_names = []
+
+    target_col = config.STANDARDIZED_TARGET_VARIABLE
+
+    for name, df_in in [('train', train_df), ('val', val_df), ('test', test_df)]:
+        logger.info(f"Processing dataset split: {name} (shape: {df_in.shape})")
+        if df_in.empty:
+            logger.warning(f"Dataset split '{name}' is empty. Skipping.")
+            # Store empty structures
+            final_data[name] = (pd.DataFrame(), pd.Series(dtype=float), pd.DataFrame())
             continue
-        if not all(col in df.columns for col in config.CYCLICAL_FEATURES + list(config.LAG_FEATURES.keys()) + list(config.ROLLING_FEATURES.keys())):
-            logger.warning(f"Dataset split '{name}' missing some columns required for feature engineering. Results may be incomplete.")
-        # 1. Cyclical Features
-        df_processed = generate_cyclical_features(df, config.CYCLICAL_FEATURES)
 
-        # 2. Lag Features
-        df_processed = generate_lag_features(df_processed, config.STANDARDIZED_TARGET_VARIABLE, config.LAG_FEATURES[config.STANDARDIZED_TARGET_VARIABLE])
-
-        # 3. Rolling Features
+        df_processed = generate_cyclical_features(df_in, config.CYCLICAL_FEATURES)
+        df_processed = generate_lag_features(df_processed, target_col, config.LAG_FEATURES[target_col])
         df_processed = generate_rolling_features(df_processed, config.ROLLING_FEATURES)
 
-        processed_datasets[name] = df_processed
+        X_df, y_series, ids_df, current_feature_names = select_final_features_and_target(df_processed, target_col)
+        final_data[name] = (X_df, y_series, ids_df)
+
+        if name == 'train':
+            final_feature_names = current_feature_names
+            if not final_feature_names:
+                 logger.error("No features selected from training data. Aborting.")
+                 # Return empty tuples to signal failure
+                 empty_res = (pd.DataFrame(), pd.Series(dtype=float), pd.DataFrame())
+                 return empty_res, empty_res, empty_res, []
+
+    if not final_data['val'][0].empty and list(final_data['val'][0].columns) != final_feature_names:
+        logger.warning("Validation set feature names mismatch training set features after engineering!")
+        try:
+            final_data['val'] = (final_data['val'][0].reindex(columns=final_feature_names, fill_value=0), final_data['val'][1], final_data['val'][2])
+            logger.info("Reindexed validation features to match training features.")
+        except Exception as e: logger.error(f"Failed to reindex validation features: {e}")
+
+    if not final_data['test'][0].empty and list(final_data['test'][0].columns) != final_feature_names:
+        logger.warning("Test set feature names mismatch training set features after engineering!")
+        try:
+            final_data['test'] = (final_data['test'][0].reindex(columns=final_feature_names, fill_value=0), final_data['test'][1], final_data['test'][2])
+            logger.info("Reindexed test features to match training features.")
+        except Exception as e: logger.error(f"Failed to reindex test features: {e}")
 
 
-    # 4. Select Final Features and Handle NaNs
-    # Important: Handle NaNs *after* generating all features for all splits
-    logger.info("Selecting final features and handling NaNs across all splits...")
-    final_data = {}
-    try:
-        X_train, y_train = select_final_features(processed_datasets['train'])
-        final_data['train'] = (X_train, y_train)
+    logger.info("--- Feature Engineering Pipeline Complete ---")
+    train_res = final_data['train']
+    val_res = final_data['val']
+    test_res = final_data['test']
+    logger.info(f"Final shapes: Train X={train_res[0].shape}, y={train_res[1].shape}, ids={train_res[2].shape}; "
+                f"Val X={val_res[0].shape}, y={val_res[1].shape}, ids={val_res[2].shape}; "
+                f"Test X={test_res[0].shape}, y={test_res[1].shape}, ids={test_res[2].shape}")
 
-        if not processed_datasets['val'].empty:
-            X_val, y_val = select_final_features(processed_datasets['val'])
-            final_data['val'] = (X_val, y_val)
-        else: final_data['val'] = (pd.DataFrame(), pd.Series()) # Empty
-
-        if not processed_datasets['test'].empty:
-            X_test, y_test = select_final_features(processed_datasets['test'])
-            final_data['test'] = (X_test, y_test)
-        else: final_data['test'] = (pd.DataFrame(), pd.Series()) # Empty
-
-        # Check feature alignment (columns should match between train, val, test X)
-        if not final_data['val'][0].empty and list(final_data['train'][0].columns) != list(final_data['val'][0].columns):
-             logger.warning("Feature columns mismatch between train and validation sets after NaN handling.")
-        if not final_data['test'][0].empty and list(final_data['train'][0].columns) != list(final_data['test'][0].columns):
-             logger.warning("Feature columns mismatch between train and test sets after NaN handling.")
-
-        # Convert to NumPy arrays for model input
-        train_X, train_y = final_data['train'][0].values, final_data['train'][1].values
-        val_X = final_data['val'][0].values if not final_data['val'][0].empty else np.array([])
-        val_y = final_data['val'][1].values if not final_data['val'][1].empty else np.array([])
-        test_X = final_data['test'][0].values if not final_data['test'][0].empty else np.array([])
-        test_y = final_data['test'][1].values if not final_data['test'][1].empty else np.array([])
-
-        logger.info("--- Feature Engineering Pipeline Complete ---")
-        logger.info(f"Final shapes: Train X={train_X.shape}, y={train_y.shape}; "
-                    f"Val X={val_X.shape}, y={val_y.shape}; Test X={test_X.shape}, y={test_y.shape}")
-
-        return train_X, train_y, val_X, val_y, test_X, test_y
-
-    except ValueError as e:
-         logger.error(f"Error during final feature selection/NaN handling: {e}", exc_info=True)
-         return np.array([]), np.array([]), np.array([]), np.array([]), np.array([]), np.array([])
+    return train_res, val_res, test_res, final_feature_names
 
 
