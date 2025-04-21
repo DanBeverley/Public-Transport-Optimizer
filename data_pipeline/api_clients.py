@@ -14,7 +14,7 @@ import httpx
 from dotenv import load_dotenv
 
 load_dotenv()
-logging.basicConfig(level=logging.INFO, fotmat="%(asctime)s - %(levelname)s - %(message)s")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
 DEFAULT_TIMEOUT = httpx.Timeout(10.0, connect=5.0)
@@ -131,13 +131,26 @@ async def get_weather_forecast(api_key:Optional[str],
               "appid":api_key,
               "units":"metric" # Celsius, m/s
               }
-    headers = {"Accept", "application/json"}
+    headers = {"Accept": "application/json"}
     logger.info(f"Fetching weather forecast for location: {location}")
     weather_data = await _make_api_request(session, "GET", request_url, params=params, headers=headers)
     if weather_data:
         logger.debug(f"Fetched weather data")
-        # TODO: add validation \ extraction of relavant fields (temp, condition, wind, preciption)
         return weather_data
+    if weather_data and isinstance(weather_data, dict) and "main" in weather_data and "weather" in weather_data:
+        try:
+            extracted_data = {
+                "temp_celsius":weather_data.get("main", {}).get("temp"),
+                "condition":weather_data.get("weather", [{}])[0].get("description"),
+                "wind_speed_mps":weather_data.get("wind", {}).get("speed"),
+                "precipitation_1h_mm":weather_data.get("rain",{}).get("1h",0) + weather_data.get("snow", {}).get("1h", 0)
+            }
+            #TODO: Further validation on type/values
+            logger.debug(f"Extracted weather: {extracted_data}")
+            return extracted_data
+        except (KeyError, IndexError, TypeError) as e:
+            logger.error(f"Error extracting weather data fields: {e} from {weather_data}")
+            return None
     else:
         logger.error("Failed to fetch weather forecast")
         return None
@@ -189,9 +202,30 @@ async def get_local_events(api_key:Optional[str],
         if not isinstance(events_list, list):
              logger.warning(f"Events response format unexpected: {events_response}")
              return []
-        # TODO Extract relevant info: name, location (lat/lon), start/end times, venue, estimated attendance (if available)
-        # Simplified example: return the raw list for now
-        return events_list
+        extracted_events = []
+        for event in events_list:
+            try:
+                name = event.get("name")
+                event_url = event.get("url")
+                start_time_str = event.get("dates", {}).get("start",{}).get("datetime")
+                start_time = datetime.fromisoformat(start_time_str.replace("Z",'+00:00')) if start_time_str else None # Handle timezone
+
+                venue_info = event.get("_embedded",{}).get("venues",[{}])[0]
+                venue_name = venue_info.get("name")
+                location = venue_info.get("location")
+                latitude = float(location.get("latitude")) if location and "latitude" in location else None
+                longitude = float(location.get("longitude")) if location and "longitude" in location else None
+                extracted_events.append({"name":name,
+                                         "start_time":start_time,
+                                         "venue":venue_name,
+                                         "latitude":latitude,
+                                         "longitude":longitude,
+                                         "url":event_url})
+            except (AttributeError, KeyError, IndexError, TypeError, ValueError) as e:
+                logger.warning(f"Could not fully parse event data: {event}. Error: {e}")
+        logger.debug(f"Extracted {len(extracted_events)} events")
+        return extracted_events
+
     else:
         logger.error("Failed to fetch local events.")
         return None  
