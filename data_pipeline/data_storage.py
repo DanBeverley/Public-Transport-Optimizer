@@ -36,13 +36,13 @@ async def get_postgres_pool() -> asyncpg.Pool:
     if _postgres_pool is None:
         logger.info(f"Initializing PostgreSQL connection pool for DNS: {'...' + POSTGRES_DNS[-20:] if POSTGRES_DNS else 'None'}")
         if not POSTGRES_DNS:
-            raise ValueError("POSTGRES_DNS enviroment variable not set")
+            raise ValueError("POSTGRES_DNS environment variable not set")
         try:
-            _postgres_pool = await asyncpg.create_pool(dns = POSTGRES_DNS,
+            _postgres_pool = await asyncpg.create_pool(dsn = POSTGRES_DNS,
                                                        min_size = 2, max_size = 10,
                                                        command_timeout = 60,
                                                        # TODO: also set up JSON and geometry types handling
-                                                       init = _init_progress_connection)
+                                                       init = _init_postgres_connection)
             logger.info("PostgreSQL connection pool initialized.")
         except Exception as e:
             logger.error(f"Failed to initialize PostgreSQL connection pool: {e}", exc_info = True)
@@ -62,7 +62,7 @@ async def get_redis_client() -> redis.Redis:
     if _redis_pool is None:
         logger.info(f"Initializing Redis client for URL: {REDIS_URL}")
         if not REDIS_URL:
-            raise ValueError("REDIS_URL enviroment variable not set")
+            raise ValueError("REDIS_URL environment variable not set")
         try:
             _redis_pool = redis.from_url(REDIS_URL, decode_responses=True,
                                          max_connections = 20)
@@ -86,7 +86,7 @@ async def close_database_connections():
         logger.info("Closing Redis client connections...")
         await _redis_pool.close() # Close the underlying pool
         _redis_pool = None
-        logger.into("Redis client connections failed")
+        logger.info("Redis client connections closed")
 
 
 # Static GTFS storage (PostgreSQL / PostGIS)
@@ -206,11 +206,11 @@ async def update_vehicle_position(vehicle_update:gtfs_realtime_pb2.VehiclePositi
     redis_client = await get_redis_client()
     # Determine primary key: prefer vehicle_id if available
     vehicle_id = vehicle_update.vehicle.id if vehicle_update.vehicle.HasField("id") else None
-    trip_id = vehicle_update.trip.trip_id if vehicle_update.trip.hasField("trip_id") else None
-    route_id = vehicle_update.trip.route_id if vehicle_update.trip.hasField("route_id") else None
+    trip_id = vehicle_update.trip.trip_id if vehicle_update.trip.HasField("trip_id") else None
+    route_id = vehicle_update.trip.route_id if vehicle_update.trip.HasField("route_id") else None
 
     if not vehicle_id and not trip_id:
-        logger.warning("VehiclePostition update missing both vehicle_id and trip_id. Cannot store")
+        logger.warning("VehiclePosition update missing both vehicle_id and trip_id. Cannot store")
         return
     
     # Use vehicle_id if present, otherwise fallback to trip_id 
@@ -232,7 +232,7 @@ async def update_vehicle_position(vehicle_update:gtfs_realtime_pb2.VehiclePositi
                      "current_status":gtfs_realtime_pb2.VehicleStopStatus.Name(vehicle_update.current_status),
                      "congestion_level":gtfs_realtime_pb2.CongestionLevel.Name(vehicle_update.congestion_level),
                      "occupancy_status":gtfs_realtime_pb2.OccupancyStatus.Name(vehicle_update.occupancy_status),
-                     "last_updated":get_current_utc_datetime().isformat()}
+                     "last_updated":get_current_utc_datetime().isoformat()}
     # Filter out None values before storing
     position_data_filtered = {k:v for k, v in position_data.items() if v is not None}
     try:
