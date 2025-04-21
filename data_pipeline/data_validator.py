@@ -39,12 +39,12 @@ def validate_static_gtfs(feed:gk.Feed) -> Tuple[List[str], List[str]]:
         Table: {row['table']}, Column: {row['column']}, Rows: {row['rows']}"
         if row["level"] == "error":
             errors.append(message)
-        elif row["level"] == "warnings":
+        elif row["level"] == "warning":
             warnings.append(message)
     # 2. Custom sanity checks
     # Check stop coordinates validity
     if 'stops' in feed.files and not feed.stops.empty:
-        invalid_lat = feed.stops[(feed.stops['stop_lat'] < MIN_LATITUDE | (feed.stops['stop_lat'] > MAX_LATITUDE))]
+        invalid_lat = feed.stops[(feed.stops['stop_lat'] < MIN_LATITUDE) | (feed.stops['stop_lat'] > MAX_LATITUDE)]
         if not invalid_lat.empty:
             warnings.append(f"Found {len(invalid_lat)} stops with invalid latitudes (outside {MIN_LATITUDE} to {MAX_LATITUDE}). IDS: {invalid_lat['stop_id'].tolist()[:5]}...")
         invalid_lon = feed.stops[(feed.stops["stop_lon"] < MIN_LONGITUDE) | (feed.stops['stop_lon'] > MAX_LONGITUDE)]
@@ -57,7 +57,7 @@ def validate_static_gtfs(feed:gk.Feed) -> Tuple[List[str], List[str]]:
             max_date = feed.calendar["end_date"].max()
             today_date = get_current_utc_datetime().strftime("%Y%m%d")
             if max_date < today_date:
-                warnings.append(f"Lastest service end date ({max_date}) is in the past")
+                warnings.append(f"Latest service end date ({max_date}) is in the past")
             #TODO: Add check for start_date being too far in future
         except KeyError:
             warnings.append("Could not perform date checks on calendar.txt (missing columns?)")
@@ -102,10 +102,12 @@ def validate_realtime_feed(feed_message:Optional[gtfs_realtime_pb2.FeedMessage],
 
     # 2. Check GTFS Version
     if feed_message.header.gtfs_realtime_version != "2.0": # Current standard
-         warnings.append(
-             f"GTFS-RT feed from {feed_url} uses version "
-             f"{feed_message.header.gtfs_realtime_version} (expected 2.0)."
-         )
+         expected_versions = {"2.0", "1.0"}
+         if feed_message.header.gtfs_realtime_version not in expected_versions:
+            warnings.append(
+                f"GTFS-RT feed from {feed_url} uses version "
+                f"'{feed_message.header.gtfs_realtime_version}' (expected one of {expected_versions}). Potential compatibility issues."
+            )
 
     # 3. Basic Entity Validation (can be expanded)
     entity_count = len(feed_message.entity)
